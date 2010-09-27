@@ -143,9 +143,9 @@ abstract class eZDBBasedClusterFileHandlerAbstractTest extends eZClusterFileHand
         $ch->storeContents( 'contents' );
         $res = $ch->endCacheGeneration();
 
-        self::assertTrue( $res );
+        self::assertTrue( $res, "endCacheGeneration didn't return true" );
         self::assertEquals( $path, $ch->filePath );
-        self::assertTrue( $ch->exists() );
+        self::assertTrue( $ch->exists(), "$path does not exist" );
     }
 
     /**
@@ -203,6 +203,10 @@ abstract class eZDBBasedClusterFileHandlerAbstractTest extends eZClusterFileHand
      */
     public function testNameTrunk( $path, $scope, $expectedNameTrunk, $expectedCacheType )
     {
+        // postgres doesn't use nametrunk
+        if ( ezpTestRunner::dsn()->parts['phptype'] == 'postgresql' )
+            self::markTestSkipped( "name_trunk isn't used by postgresql" );
+
         $ch = self::createFile( $path, false, array( 'scope' => $scope ) );
         self::assertEquals( $expectedNameTrunk, $ch->metaData['name_trunk'] );
         self::assertEquals( $expectedCacheType, $ch->cacheType );

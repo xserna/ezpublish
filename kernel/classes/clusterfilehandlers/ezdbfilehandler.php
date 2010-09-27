@@ -1207,6 +1207,10 @@ class eZDBFileHandler
     **/
     public function startCacheGeneration()
     {
+        // Already generating, stom right there
+        if ( $this->realFilePath !== null )
+            return false;
+
         $generatingFilePath = $this->filePath . '.generating';
         $ret = $this->backend->_startCacheGeneration( $this->filePath, $generatingFilePath );
 
@@ -1237,6 +1241,9 @@ class eZDBFileHandler
     **/
     public function endCacheGeneration( $rename = true )
     {
+        if ( $this->realFilePath === null )
+            return false;
+
         if ( $this->backend->_endCacheGeneration( $this->realFilePath, $this->filePath, $rename ) )
         {
             $this->filePath = $this->realFilePath;

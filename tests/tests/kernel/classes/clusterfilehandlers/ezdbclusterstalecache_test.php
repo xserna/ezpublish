@@ -29,11 +29,6 @@ class eZDBClusterStaleCacheTest extends eZClusterStaleCacheTest
     {
         parent::setUp();
 
-        if ( !( $this->sharedFixture instanceof eZMySQLDB ) and !( $this->sharedFixture instanceof eZMySQLiDB ) )
-        {
-            self::markTestSkipped( "Not using mysql interface, skipping" );
-        }
-
         // We need to clear the existing handler if it was loaded before the INI
         // settings changes
         if ( isset( $GLOBALS['eZClusterFileHandler_chosen_handler'] ) and
@@ -57,6 +52,10 @@ class eZDBClusterStaleCacheTest extends eZClusterStaleCacheTest
 
             case 'mysqli':
                 $backend = 'eZDBFileHandlerMysqliBackend';
+                break;
+
+            case 'postgresql':
+                $backend = 'eZDBFileHandlerPostgresqlBackend';
                 break;
 
             default:

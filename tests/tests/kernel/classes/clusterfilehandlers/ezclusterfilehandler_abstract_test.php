@@ -878,7 +878,7 @@ abstract class eZClusterFileHandlerAbstractTest extends ezpDatabaseTestCase
         $ch->fileMove( $sourcePath, $destinationPath );
 
         // check existence on both
-        self::assertFalse( $ch->fileExists( $sourcePath ), "Source file still longer exists" );
+        self::assertFalse( $ch->fileExists( $sourcePath ), "Source file still exists" );
         self::assertTrue( $ch->fileExists( $destinationPath ), "Destination file doesn't exist" );
 
         self::deleteLocalFiles( $sourcePath, $destinationPath );
@@ -905,7 +905,7 @@ abstract class eZClusterFileHandlerAbstractTest extends ezpDatabaseTestCase
         $ch->move( $destinationPath );
 
         // check existence on both
-        self::assertFalse( $ch->fileExists( $sourcePath ), "Source file still longer exists" );
+        self::assertFalse( $ch->fileExists( $sourcePath ), "Source file still exists" );
         self::assertTrue( $ch->fileExists( $destinationPath ), "Destination file doesn't exist" );
 
         self::deleteLocalFiles( $sourcePath, $destinationPath );

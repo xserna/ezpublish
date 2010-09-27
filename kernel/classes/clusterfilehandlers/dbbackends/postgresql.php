@@ -39,17 +39,23 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
         }
 
         $tries = 0;
-        $connectString = eZPostgreSQLDB::connectString(
-            self::$dbparams['host'], self::$dbparams['port'], self::$dbparams['dbname'], self::$dbparams['user'], self::$dbparams['pass'] );
+        $connectString  = sprintf( 'pgsql:host=%s;dbname=%s;port=%s', self::$dbparams['host'], self::$dbparams['dbname'], self::$dbparams['port'] );
         while ( $tries < self::$dbparams['max_connect_tries'] )
         {
-
-            if ( $this->db = pg_connect( $connectString ) )
-                break;
-            ++$tries;
+            try {
+                $this->db = new PDO( $connectString, self::$dbparams['user'], self::$dbparams['pass'] );
+            } catch ( PDOException $e ) {
+                eZDebug::writeError( $e->getMessage() );
+                ++$tries;
+                continue;
+            }
+            break;
         }
-        if ( !$this->db )
+        if ( !( $this->db instanceof PDO ) )
             return $this->_die( "Unable to connect to storage server" );
+
+        $this->db->setAttribute( PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION );
+        $this->db->exec( 'SET NAMES \'utf8\'' );
     }
 
     function _copy( $srcFilePath, $dstFilePath, $fname = false )
@@ -76,19 +82,16 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
         $scope           = $metaData['scope'];
         $contentLength   = $metaData['size'];
         $fileMTime       = $metaData['mtime'];
-        $nameTrunk       = self::nameTrunk( $dstFilePath, $scope );
 
         // Copy file metadata.
-        if ( $this->_insertUpdate( TABLE_METADATA,
-                                   array( 'datatype'=> $datatype,
+        if ( $this->_insertUpdate( array( 'datatype'=> $datatype,
                                           'name' => $dstFilePath,
-                                          'name_trunk' => $nameTrunk,
                                           'name_hash' => $filePathHash,
                                           'scope' => $scope,
                                           'size' => $contentLength,
                                           'mtime' => $fileMTime,
                                           'expired' => ($fileMTime < 0) ? 1 : 0 ),
-                                   "datatype=VALUES(datatype), scope=VALUES(scope), size=VALUES(size), mtime=VALUES(mtime), expired=VALUES(expired)",
+                                   array( 'datatype', 'scope', 'size', 'mtime', 'expired' ),
                                    $fname ) === false )
         {
             return $this->_fail( $srcFilePath, "Failed to insert file metadata on copying." );
@@ -96,7 +99,7 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
 
         // Copy file data.
 
-        $sql = "SELECT filedata, offset FROM " . TABLE_DATA . " WHERE name_hash=" . $this->_md5( $srcFilePath ) . " ORDER BY offset";
+        /*$sql = "SELECT filedata, offset FROM " . TABLE_DATA . " WHERE name_hash=" . $this->_quote( md5 ( $srcFilePath ) ) . " ORDER BY offset";
         if ( !$res = $this->_query( $sql, $fname ) )
         {
             eZDebug::writeError( "Failed to fetch source file '$srcFilePath' data on copying.", __METHOD__ );
@@ -138,7 +141,7 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
         // Get rid of unused/old offset data.
         $result = $this->_cleanupFiledata( $dstFilePath, $contentLength, $fname );
         if ( $this->_isFailure( $result ) )
-            return $result;
+            return $result;*/
 
         return true;
     }
@@ -152,7 +155,7 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
             $fname .= "::_purge($filePath)";
         else
             $fname = "_purge($filePath)";
-        $sql = "DELETE FROM " . TABLE_METADATA . " WHERE name_hash=" . $this->_md5( $filePath );
+        $sql = "DELETE FROM " . TABLE_METADATA . " WHERE name_hash=" . $this->_quote( md5( $filePath ) );
         if ( $expiry !== false )
             $sql .= " AND mtime < " . (int)$expiry;
         elseif ( $onlyExpired )
@@ -185,9 +188,12 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
             $where[] = "name_hash = any( array( SELECT name_hash FROM ezdbfile WHERE name LIKE " . $this->_quote( $like ) . " LIMIT $limit ) )";
 
         $sql .= implode( ' AND ', $where );
-        if ( !$res = $this->_query( $sql, $fname ) )
-            return $this->_fail( "Purging file metadata by like statement $like failed" );
-        return pg_affected_rows( $res );
+        try {
+            $affectedRows = $this->db->exec( $sql );
+        } catch( Exception $e ) {
+            return $this->_fail( "Purging file metadata by like statement $like failed" );;
+        }
+        return $affectedRows;
     }
 
     function _delete( $filePath, $insideOfTransaction = false, $fname = false )
@@ -211,8 +217,12 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
 
     function _deleteInner( $filePath, $fname )
     {
-        if ( !$this->_query( "UPDATE ezdbfile SET mtime=-ABS(mtime), expired=1 WHERE name_hash=" . $this->_md5( $filePath ), $fname ) )
-            return $this->_fail( "Deleting file $filePath failed" );
+        $sql = "UPDATE ezdbfile SET mtime=-ABS(mtime), expired=1 WHERE name_hash=" . $this->_quote( md5( $filePath ) );
+        try {
+            $this->db->exec( $sql );
+        } catch( PDOException $e ) {
+            return $this->_fail( "Deleting file $filePath failed", $e->getMessage() );
+        }
         return true;
     }
 
@@ -229,9 +239,10 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
     function _deleteByLikeInner( $like, $fname )
     {
         $sql = "UPDATE ezdbfile SET mtime=-ABS(mtime), expired=1\nWHERE name like ". $this->_quote( $like );
-        if ( !$res = $this->_query( $sql, $fname ) )
-        {
-            return $this->_fail( "Failed to delete files by like: '$like'" );
+        try {
+            $this->db->exec( $sql );
+        } catch( PDOException $e ) {
+            return $this->_fail( "Failed to delete files by like: '$like'", $e->getMessage() );
         }
         return true;
     }
@@ -249,7 +260,7 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
     function _deleteByRegexInner( $regex, $fname )
     {
         $sql = "UPDATE ezdbfile SET mtime=-ABS(mtime), expired=1\nWHERE name REGEXP " . $this->_quote( $regex );
-        if ( !$res = $this->_query( $sql, $fname ) )
+        if ( !$res = $this->db->exec( $sql ) )
         {
             return $this->_fail( "Failed to delete files by regex: '$regex'" );
         }
@@ -280,7 +291,7 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
                               $regex );
 
         $sql = "UPDATE ezdbfile SET mtime=-ABS(mtime), expired=1\nWHERE name REGEXP '$regex'";
-        if ( !$res = $this->_query( $sql, $fname ) )
+        if ( !$res = $this->db->exec( $sql ) )
         {
             return $this->_fail( "Failed to delete files by wildcard: '$wildcard'" );
         }
@@ -301,16 +312,17 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
     {
         foreach ( $dirList as $dirItem )
         {
-            if ( strstr( $commonPath, '/cache/content' ) !== false or strstr( $commonPath, '/cache/template-block' ) !== false )
+            /*if ( strstr( $commonPath, '/cache/content' ) !== false or strstr( $commonPath, '/cache/template-block' ) !== false )
             {
                 $where = "WHERE name_trunk = '$commonPath/$dirItem/$commonSuffix'";
             }
             else
             {
-                $where = "WHERE name LIKE '$commonPath/$dirItem/$commonSuffix%'";
-            }
+            $where = "WHERE name LIKE '$commonPath/$dirItem/$commonSuffix%'";
+            }*/
+            $where = "WHERE name LIKE '$commonPath/$dirItem/$commonSuffix%'";
             $sql = "UPDATE ezdbfile SET mtime=-ABS(mtime), expired=1\n$where";
-            if ( !$res = $this->_query( $sql, $fname ) )
+            if ( !$res = $this->db->exec( $sql ) )
             {
                 eZDebug::writeError( "Failed to delete files in dir: '$commonPath/$dirItem/$commonSuffix%'", __METHOD__ );
             }
@@ -325,8 +337,8 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
             $fname .= "::_exists($filePath)";
         else
             $fname = "_exists($filePath)";
-        $row = $this->_selectOneRow( "SELECT name, mtime FROM ezdbfile WHERE name_hash=" . $this->_md5( $filePath ),
-                                     $fname, "Failed to check file '$filePath' existance: ", true );
+        $sql = "SELECT name, mtime FROM ezdbfile WHERE name_hash=" . $this->_quote( md5( $filePath ) );
+        $row = $this->_selectOneRow( $sql, $fname, "Failed to check file '$filePath' existance: ", true );
         if ( $row === false )
             return false;
 
@@ -460,11 +472,12 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
             $fname = "_fetchLob( $filePath )";
 
         $this->_begin();
-        $sql = "SELECT size, data FROM ezdbfile WHERE name_hash=" . $this->_md5( $filePath );
+        $sql = "SELECT size, data FROM ezdbfile WHERE name_hash=" . $this->_quote( md5( $filePath ) );
         $row = $this->_selectOneAssoc( $sql, $fname );
 
-        $loid = pg_lo_open( $this->db, $row['data'], 'r' );
-        $contents = pg_lo_read( $loid, $row['size'] );
+        $lob = $this->db->pgsqlLOBOpen( $row['data'], 'rb' );
+        $contents = stream_get_contents( $lob );
+        $lob = null;
 
         $this->_commit();
 
@@ -480,7 +493,7 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
             $fname .= "::_fetchMetadata($filePath)";
         else
             $fname = "_fetchMetadata($filePath)";
-        $sql = "SELECT * FROM ezdbfile WHERE name_hash=" . $this->_md5( $filePath );
+        $sql = "SELECT * FROM ezdbfile WHERE name_hash=" . $this->_quote( md5( $filePath ) );
         return $this->_selectOneAssoc( $sql, $fname,
                                        "Failed to retrieve file metadata: $filePath",
                                        true );
@@ -534,50 +547,23 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
         if ( !$metaData ) // if source file does not exist then do nothing.
             return false;
 
+        // fetch target file metadata, just to make sure it doesn't exist
+        $dstMetaData = $this->_fetchMetadata( $dstFilePath );
+        if ( $dstMetaData !== false )
+        {
+            eZDebug::writeDebug("Attempt to move {$srcFilePath} file over an existing file", __METHOD__ );
+            return false;
+        }
+
         $this->_begin( __METHOD__ );
 
-        $srcFilePathStr  = pg_escape_string( $this->db, $srcFilePath );
-        $dstFilePathStr  = pg_escape_string( $this->db, $dstFilePath );
-        $dstNameTrunkStr = pg_escape_string( $this->db, self::nameTrunk( $dstFilePath, $metaData['scope'] ) );
-
-        // Mark entry for update to lock it
-        $sql = "SELECT * FROM ezdbfile WHERE name_hash = '" . $this->_md5( $srcFilePathStr ) . "' FOR UPDATE";
-        if ( !$this->_query( $sql, "_rename($srcFilePath, $dstFilePath)" ) )
-        {
-            eZDebug::writeError( "Failed locking file '$srcFilePath'", __METHOD__ );
-            $this->_rollback( __METHOD__ );
-            return false;
-        }
-
-        if ( $this->_exists( $dstFilePath, false, false ) )
-            $this->_purge( $dstFilePath, false );
-
-        // Create a new meta-data entry for the new file to make foreign keys happy.
-        $sql = "INSERT INTO ezdbfile (name, name_trunk, name_hash, datatype, scope, size, mtime, expired) SELECT '$dstFilePathStr' AS name, '$dstNameTrunkStr' as name_trunk, MD5('$dstFilePathStr') AS name_hash, datatype, scope, size, mtime, expired FROM " . TABLE_METADATA . " WHERE name_hash=MD5('$srcFilePathStr')";
-        if ( !$this->_query( $sql, "_rename($srcFilePath, $dstFilePath)" ) )
-        {
-            eZDebug::writeError( "Failed making new file entry '$dstFilePath'", __METHOD__ );
-            $this->_rollback( __METHOD__ );
-            return false;
-        }
-
-        // Update data chunks to refer to the new file entry.
-        $sql = "UPDATE " . TABLE_DATA . " SET name_hash=MD5('$dstFilePathStr') WHERE name_hash=MD5('$srcFilePathStr')";
-        if ( !$this->_query( $sql, "_rename($srcFilePath, $dstFilePath)" ) )
-        {
-            eZDebug::writeError( "Failed renaming file '$srcFilePath' to '$dstFilePath'", __METHOD__ );
-            $this->_rollback( __METHOD__ );
-            return false;
-        }
-
-        // Remove old entry
-        $sql = "DELETE FROM ezdbfile WHERE name_hash=MD5('$srcFilePathStr')";
-        if ( !$this->_query( $sql, "_rename($srcFilePath, $dstFilePath)" ) )
-        {
-            eZDebug::writeError( "Failed removing old file '$srcFilePath'", __METHOD__ );
-            $this->_rollback( __METHOD__ );
-            return false;
-        }
+        // Just rename the file. The OID takes care of the rest.
+        $sql = "UPDATE  ezdbfile SET name = :destinationName, name_hash = :destinationNameHash WHERE name_hash = :sourceNameHash";
+        $st = $this->db->prepare( $sql );
+        $st->bindValue( ':destinationName',     $dstFilePath );
+        $st->bindValue( ':destinationNameHash', md5( $dstFilePath ) );
+        $st->bindValue( ':sourceNameHash',      md5( $srcFilePath ) );
+        $st->execute();
 
         $this->_commit( __METHOD__ );
 
@@ -653,8 +639,15 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
                              'scope' => $scope,
                              'size' => $contentLength,
                              'mtime' => $curTime,
-                             'expired' => ( $curTime < 0 ) ? 1 : 0 );
-        $this->_insertUpdate( $insertData, false, $fname, true, array( '_storeLobFromData', $contents ) );
+                             'expired' => ( $curTime < 0 ) ? 1 : 0,
+                             'data' => array( 'contents' => $contents ) );
+        $updateData = array( 'datatype' => $insertData['datatype'],
+                             'scope' => $insertData['scope'],
+                             'size' => $insertData['size'],
+                             'mtime' => $insertData['mtime'],
+                             'expired' => $insertData['expired'],
+                             'data' => $insertData['data'] );
+        $this->_insertUpdate( $insertData, $updateData, $fname );
         /*
            $this->_begin();
         $oid = pg_lo_create( $this->db );
@@ -721,21 +714,21 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
     {
         if ( $this->db )
         {
-            eZDebug::writeError( $sql, "$msg" . pg_last_error( $this->db ) );
+            eZDebug::writeError( $sql, $msg );
         }
         else
         {
             /// @todo to be fixed: will this generate a warning?
-            eZDebug::writeError( $sql, "$msg: " . mysqli_error() );
+            eZDebug::writeError( $sql, $msg );
         }
     }
 
-    /*!
-    Performs an insert of the given items in $array.
-
-    \param $table Name of table to execute insert on.
-    \param $array Associative array with data to insert, the keys are the field names and the values will be quoted according to type.
-    \param $fname Name of caller.
+    /**
+     *Performs an insert of the given items in $array.
+     *
+     * @param string $table Name of table to execute insert on.
+     * @param array $array Associative array with data to insert, the keys are the field names and the values will be quoted according to type.
+     * @param string $fname Name of caller.
      */
     function _insert( $table, $array, $fname )
     {
@@ -749,10 +742,10 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
      * to update the entry.
      *
      * @param string $table Name of table to execute insert on.
-     * @param array $array
+     * @param array $insertData
      *        Associative array with data to insert, the keys are the field names and the values will be
      *        quoted according to type.
-     * @param string $update Partial update SQL which is executed when entry exists.
+     * @param array $updateData Partial update SQL which is executed when entry exists.
      * @param string $fname Name of caller.
      * @param mixed $lobCallback
      *        Callback to be used to insert a binary file. The name of a function callable on the current object must
@@ -761,35 +754,128 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
      *
      * @return int Query result
      */
-    function _insertUpdate( $array, $update, $fname, $reportError = true, $lobCallback = false )
+    function _insertUpdate( $insertData, $updateData, $fname, $reportError = true )
     {
         $this->_begin();
 
-        // We have binary data, insert the LOB placeholder
-        if ( $lobCallback !== false )
+        // Create the insert query
+        $keys = array_keys( $insertData );
+        $placeHolderValues = array_fill( 0, count( $insertData ), '?' );
+
+        // Create a savepoint so that the transaction can cleanly be resumed if a duplicate key error occurs
+        $this->db->exec( 'SAVEPOINT step1' );
+        $sql = "INSERT INTO ezdbfile (" . implode(', ', $keys ) . ") VALUES( " . implode( ', ', $placeHolderValues ) . ")";
+        $st = $this->db->prepare( $sql );
+        $num = 1;
+
+        // map the fields to the query
+        foreach( $insertData as $field => $value )
         {
-            $oid = pg_lo_create( $this->db );
-            $array['data'] = $oid;
+            // data with a contents index doesn't require anything else
+            // with a filepath it requires a handle to be created
+            if ( $field === 'data' )
+            {
+                $oid = $this->db->pgsqlLOBCreate();
+                $oidStream = $this->db->pgsqlLOBOpen( $oid, 'w' );
+                if ( isset( $value['filepath'] ) )
+                {
+                    $dataHandle = fopen( $value['filepath'], 'rb' );
+                    stream_copy_to_stream( $dataHandle, $oidStream );
+                    $dataHandle = null;
+
+                }
+                elseif ( isset( $value['contents'] ) )
+                {
+                    fwrite( $oidStream, $value['contents'] );
+                }
+                else
+                {
+                    throw new Exception( "Unknown value for 'data'. Only 'filepath' and 'contents' are accepted" );
+                }
+                $oidStream = null;
+
+                $value = (int)$oid;
+            }
+
+            $st->bindValue( $num, $value, $this->_PDOtype( $field ) );
+            $num++;
         }
 
-        $keys = array_keys( $array );
-        $values = array_values( $array );
-        $placeHolderValues = array();
-        for( $i = 1; $i <= count( $array ); $i++ )
-            $placeHolderValues[] = "\${$i}";
+        // Try to execute the insert
+        try {
+            $result = $st->execute();
+        } catch( PDOException $e ) {
+            // The insert has failed becausse of a duplicate key error => update the row instead
+            if ( $e->errorInfo[0] === self::DBERROR_DUPLICATE_KEY )
+            {
+                $this->db->exec( 'ROLLBACK TO SAVEPOINT step1' );
 
-        // Commencer par un UPDATE, si no affected rows, INSERT
-        $sql = "INSERT INTO ezdbfile (" . implode(', ', $keys ) . ") VALUES( " . implode( ', ', $placeHolderValues ) . ")";
-        $result = pg_query_params( $sql, $values );
+                // create the query with placeholders
+                $sql = "UPDATE ezdbfile SET ";
+                $sqlFields = array();
+                $values = array();
+                foreach( $updateData as $field => $value )
+                {
+                    // LOB handling
+                    if ( $field === 'data' )
+                    {
+                        $oid = $this->db->pgsqlLOBCreate();
+                        $oidStream = $this->db->pgsqlLOBOpen( $oid, 'w' );
+                        if ( isset( $value['filepath'] ) )
+                        {
+                            $dataHandle = fopen( $value['filepath'], 'rb' );
+                            stream_copy_to_stream( $dataHandle, $oidStream );
+                            $dataHandle = null;
+
+                        }
+                        elseif ( isset( $value['contents'] ) )
+                        {
+                            fwrite( $oidStream, $value['contents'] );
+                        }
+                        else
+                        {
+                            throw new Exception( "Unknown value for 'data'. Only 'filepath' and 'contents' are accepted" );
+                        }
+                        $oidStream = null;
+
+                        $value = (int)$oid;
+                    }
+
+                    $sqlFields[] = "{$field} = ?";
+                    $values[$field] = $value;
+                }
+                $sql .= implode( ', ', $sqlFields );
+                $st = $this->db->prepare( $sql );
+
+                // bind the query values
+                $index = 1;
+                foreach( $values as $field => $value )
+                {
+                    $st->bindValue( $index, $value, $this->_PDOtype( $field) );
+                    $index++;
+                }
+                try {
+                    $result = $st->execute();
+                } catch( PDOException $e ) {
+                }
+                $this->_commit();
+                return true;
+            }
+            else
+            {
+                $this->_rollback();
+                eZDebug::writeError( "SQL Error: {$e->errorInfo[2]}", __METHOD__ );
+                return false;
+            }
+        }
 
         if ( $this->_isFailure( $result ) )
+        {
+            $this->_rollback();
             return $result;
+        }
 
-        // insert binary data
-        $callbackMethod = $lobCallback[0];
-        $callbackParameter = $lobCallback[1];
-        $this->$callbackMethod( $oid, $lobCallback[1] );
-
+        // The record has been correctly added, send the binary data
         $this->_commit();
     }
 
@@ -822,22 +908,23 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
      */
     function _selectOneRow( $query, $fname, $error = false, $debug = false )
     {
-        return $this->_selectOne( $query, $fname, $error, $debug, 'pg_fetch_row' );
+        return $this->_selectOne( $query, $fname, $error, $debug, PDO::FETCH_NUM );
     }
 
-    /*!
-     Common select method for doing a SELECT query which is passed in $query and
-     fetching one row from the result.
-     If there are more than one row it will fail and exit, if 0 it returns false.
-     The returned row is an associative array.
-
-     \param $fname The function name that started the query, should contain relevant arguments in the text.
-     \param $error Sent to _error() in case of errors
-     \param $debug If true it will display the fetched row in addition to the SQL.
+    /**
+     * Common select method for doing a SELECT query which is passed in $query and
+     * fetching one row from the result.
+     * If there are more than one row it will fail and exit, if 0 it returns false.
+     * The returned row is an associative array.
+     *
+     * @param string $query
+     * @param string $fname The function name that started the query, should contain relevant arguments in the text.
+     * @param string $error Sent to _error() in case of errors
+     * @param bool $debug If true it will display the fetched row in addition to the SQL.
      */
     function _selectOneAssoc( $query, $fname, $error = false, $debug = false )
     {
-        return $this->_selectOne( $query, $fname, $error, $debug, 'pg_fetch_assoc' );
+        return $this->_selectOne( $query, $fname, $error, $debug, PDO::FETCH_ASSOC );
     }
 
     /**
@@ -847,52 +934,42 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
      * @param string $fname The function name that started the query, should contain relevant arguments in the text.
      * @param mixed  $error Sent to _error() in case of errors
      * @param bool   $debug If true it will display the fetched row in addition to the SQL.
-     * @param string $fetchCall The callback to fetch the row.
+     * @param string $fetchMode Which fetch mode must be used (one of PDO::FETCH_*)
      */
-    function _selectOne( $query, $fname, $error = false, $debug = false, $fetchCall )
+    function _selectOne( $query, $fname, $error = false, $debug = false, $fetchMode )
     {
         eZDebug::accumulatorStart( 'pg_cluster_query', 'pg_cluster_total', 'PostgreSQL_Cluster_queries' );
-        $time = microtime( true );
 
-        $res = pg_query( $this->db, $query );
+        $res = $this->_query( $query );
         if ( !$res )
-        {
-            $this->_error( $query, $fname, $error );
-            eZDebug::accumulatorStop( 'pgsql_cluster_query' );
             return false;
-        }
 
-        $this->_report( $query, $fname, microtime( true ) - $time );
-
-        // we test the return value of mysqli_num_rows and not mysql_fetch, unlike in the mysql handler,
-        // since fetch will return null and not false if there are no results
-        $nRows = pg_num_rows( $res );
-        if ( $nRows > 1 )
+        $rowCount = $res->rowCount();
+        if ( $rowCount > 1 )
         {
             eZDebug::writeError( 'Duplicate entries found', $fname );
             eZDebug::accumulatorStop( 'pg_cluster_query' );
-            // @todo Throw an exception
             return false;
         }
-        elseif ( $nRows === 0 )
+        elseif ( $rowCount === 0 )
         {
             eZDebug::accumulatorStop( 'pg_cluster_query' );
             return false;
         }
 
-        $row = $fetchCall( $res );
-        pg_free_result( $res );
+        $row = $res->fetch( $fetchMode );
+        $res = null;
         if ( $debug )
-            $query = "SQL for _selectOneAssoc:\n" . $query . "\n\nRESULT:\n" . var_export( $row, true );
+            $query = "SQL for _selectOne:\n" . $query . "\n\nRESULT:\n" . var_export( $row, true );
 
         eZDebug::accumulatorStop( 'pg_cluster_query' );
 
         return $row;
     }
 
-    /*!
-      Starts a new transaction by executing a BEGIN call.
-      If a transaction is already started nothing is executed.
+    /**
+     * Starts a new transaction by executing a BEGIN call.
+     * If a transaction is already started nothing is executed.
      */
     function _begin( $fname = false )
     {
@@ -905,9 +982,9 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
             $this->_query( "BEGIN", $fname );
     }
 
-    /*!
-      Stops a current transaction and commits the changes by executing a COMMIT call.
-      If the current transaction is a sub-transaction nothing is executed.
+    /**
+     * Stops a current transaction and commits the changes by executing a COMMIT call.
+     * If the current transaction is a sub-transaction nothing is executed.
      */
     function _commit( $fname = false )
     {
@@ -921,8 +998,8 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
     }
 
     /*!
-      Stops a current transaction and discards all changes by executing a ROLLBACK call.
-      If the current transaction is a sub-transaction nothing is executed.
+     * Stops a current transaction and discards all changes by executing a ROLLBACK call.
+     * If the current transaction is a sub-transaction nothing is executed.
      */
     function _rollback( $fname = false )
     {
@@ -1057,7 +1134,7 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
         $maxTries = self::$dbparams['max_execute_tries'];
         while ( $tries < $maxTries )
         {
-            $res = $this->_query( "SELECT * FROM ezdbfile WHERE name_hash=" . $this->_md5( $filePath ) . " LOCK IN SHARE MODE", $fname, false ); // turn off error reporting
+            $res = $this->_query( "SELECT * FROM ezdbfile WHERE name_hash=" . $this->_quote( md5( $filePath ) ) . " LOCK IN SHARE MODE", $fname, false ); // turn off error reporting
             $errno = mysqli_errno( $this->db );
             if ( $errno == 1205 || // Error: 1205 SQLSTATE: HY000 (ER_LOCK_WAIT_TIMEOUT)
                  $errno == 1213 )  // Error: 1213 SQLSTATE: 40001 (ER_LOCK_DEADLOCK)
@@ -1181,32 +1258,32 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
         return new eZMySQLBackendError( $value, $text );
     }
 
-    /*!
-     Performs mysql query and returns mysql result.
-     Times the sql execution, adds accumulator timings and reports SQL to debug.
-
-     \param $fname The function name that started the query, should contain relevant arguments in the text.
+    /**
+     * Performs mysql query and returns mysql result.
+     * Times the sql execution, adds accumulator timings and reports SQL to debug.
+     *
+     * @param string $query
+     * @param string $fname The function name that started the query, should contain relevant arguments in the text.
+     * @param bool $reportError
+     *
+     * @return PDOStatement
      */
     function _query( $query, $fname = false, $reportError = true )
     {
-        eZDebug::accumulatorStart( 'pgsql_cluster_query', 'pgsql_cluster_total', 'PostgreSQL_cluster_queries' );
         $time = microtime( true );
 
-        $res = pg_query( $this->db, $query );
-        if ( !$res && $reportError )
-        {
-            $this->_error( $query, $fname );
+        eZDebug::accumulatorStart( 'pgsql_cluster_query', 'pgsql_cluster_total', 'PostgreSQL_cluster_queries' );
+        try {
+            $res = $this->db->query( $query );
+        } catch( PDOException $e ) {
+            if ( $reportError )
+                $this->_error( $query, $fname, $e->getMessage() );
+            return false;
         }
-        $numRows = 0;
-        if ( is_object( $res ) )
-        {
-            $numRows = pg_num_rows( $res );
-        }
-
-        $time = microtime( true ) - $time;
         eZDebug::accumulatorStop( 'pg_cluster_query' );
 
-        $this->_report( $query, $fname, $time, $numRows );
+        $this->_report( $query, $fname, microtime( true ) - $time, $res->rowCount() );
+
         return $res;
     }
 
@@ -1219,18 +1296,18 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
         if ( $value === null )
             return 'NULL';
         elseif ( is_integer( $value ) )
-            return (string)$value;
+            return $value;
         else
-            return "'" . pg_escape_string( $this->db, $value ) . "'";
+            return $this->db->quote( $value );
     }
 
-    /*!
-     Make sure that $value is escaped and qouted and turned into and MD5.
-     The returned value can directly be put into SQLs.
+    /**
+     * Returns the md5 sum for a name hash
+     * @todo This function really isn't that useful now that it no longer quotes...
      */
     function _md5( $value )
     {
-        return "'" . md5( $value ) . "'";
+        return md5( $value );
     }
 
     /*!
@@ -1252,7 +1329,7 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
             $error = $error[0];
         }
 
-        eZDebug::writeError( "$error\n" . pg_last_error( $this->db ) );
+        eZDebug::writeError( $error );
     }
 
     /**
@@ -1294,39 +1371,41 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
     {
         $fname = "_startCacheGeneration( {$filePath} )";
 
-        $nameHash = $this->_md5( $generatingFilePath );
+        $nameHash = md5( $generatingFilePath );
         $mtime = time();
 
-        $insertData = array( 'name' => "'" . pg_escape_string( $this->db, $generatingFilePath ) . "'",
-                             'name_hash' => $nameHash,
-                             'scope' => "''",
-                             'datatype' => "''",
-                             'mtime' => $mtime,
+        $insertData = array( 'name' => $this->_quote( $generatingFilePath ),
+                             'name_hash' => $this->_quote( $nameHash ),
+                             'scope' => $this->_quote( '' ),
+                             'datatype' => $this->_quote( '' ),
+                             'mtime' => $this->_quote( $mtime ),
                              'expired' => 0 );
         $query = 'INSERT INTO ezdbfile ( '. implode(', ', array_keys( $insertData ) ) . ' ) ' .
                  "VALUES(" . implode( ', ', $insertData ) . ")";
 
-        $result = $this->_query( $query, "_startCacheGeneration( $filePath )", false );
-        if ( !$result )
-        {
-            $errno = pg_result_error_field( $this->db, PGSQL_DIAG_SQLSTATE );
-            if ( $errno != 1062 )
+        try {
+            $result = $this->db->exec( $query );
+        } catch( PDOException $e ) {
+            $errno = $e->errorInfo[0];
+
+            // unexpected error
+            if ( $errno != self::DBERROR_DUPLICATE_KEY )
             {
-                eZDebug::writeError( "Unexpected error #$errno when trying to start cache generation on $filePath (".mysqli_error( $this->db ).")", __METHOD__ );
+                eZDebug::writeError( "Unexpected error #$errno when trying to start cache generation on $filePath ({$e->errorInfo[2]})", __METHOD__ );
                 eZDebug::writeDebug( $query, '$query' );
 
                 // @todo Make this an actual error, maybe an exception
                 return array( 'res' => 'ko' );
             }
-            // error 1062 is expected, since it means duplicate key (file is being generated)
+            // expected duplicate key error
             else
             {
                 // generation timout check
-                $query = "SELECT mtime FROM ezdbfile WHERE name_hash = {$nameHash}";
+                $query = "SELECT mtime FROM ezdbfile WHERE name_hash = " . $this->_quote( $nameHash );
                 $row = $this->_selectOneRow( $query, $fname, false, false );
 
                 // file has been renamed, i.e it is no longer a .generating file
-                if( $row and !isset( $row[0] ) )
+                if( $row === false )
                     return array( 'result' => 'ok', 'mtime' => $mtime );
 
                 $remainingGenerationTime = $this->remainingCacheGenerationTime( $row );
@@ -1335,20 +1414,24 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
                     $previousMTime = $row[0];
 
                     eZDebugSetting::writeDebug( 'kernel-clustering', "$filePath generation has timedout (timeout=".self::$dbparams['cache_generation_timeout']."), taking over", __METHOD__ );
-                    $updateQuery = "UPDATE ezdbfile SET mtime = {$mtime} WHERE name_hash = {$nameHash} AND mtime = {$previousMTime}";
-                    eZDebug::writeDebug( $updateQuery, '$updateQuery' );
+                    $updateQuery = "UPDATE ezdbfile SET mtime = :mtime WHERE name_hash = :nameHash AND mtime = :previousMtime";
+                    $st = $this->db->prepare( $updateQuery );
+                    $st->bindValue( ':mtime', $mtime );
+                    $st->bindValue( ':nameHash', $nameHash );
+                    $st->bindValue( ':previousMtime', $previousMTime );
 
                     // we run the query manually since the default _query won't
                     // report affected rows
-                    $res = pg_query( $this->db, $updateQuery );
-                    if ( ( $res !== false ) and pg_affected_rows( $this->db ) == 1 )
+                    $result = $st->execute();
+                    if ( ( $result !== false ) && ( $st->rowCount() === 1  ) )
                     {
                         return array( 'result' => 'ok', 'mtime' => $mtime );
                     }
                     else
                     {
                         // @todo This would require an actual error handling
-                        eZDebug::writeError( "An error occured taking over timedout generating cache file $generatingFilePath (".pg_last_error( $this->db ).")", __METHOD__ );
+                        $error = $st->errorInfo();
+                        eZDebug::writeError( "An error occured taking over timedout generating cache file $generatingFilePath ({$error[2]})", __METHOD__ );
                         return array( 'result' => 'error' );
                     }
                 }
@@ -1358,10 +1441,7 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
                 }
             }
         }
-        else
-        {
-            return array( 'result' => 'ok', 'mtime' => $mtime );
-        }
+        return array( 'result' => 'ok', 'mtime' => $mtime );
     }
 
     /**
@@ -1379,7 +1459,7 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
         // if no rename is asked, the .generating file is just removed
         if ( $rename === false )
         {
-            if ( !$this->_query( "DELETE FROM ezdbfile WHERE name_hash=MD5('$generatingFilePath')" ) )
+            if ( !$this->db->exec( "DELETE FROM ezdbfile WHERE name_hash=" . $this->_quote( md5( $generatingFilePath ) ) ) )
             {
                 eZDebug::writeError( "Failed removing metadata entry for '$generatingFilePath'", $fname );
                 return false;
@@ -1393,55 +1473,59 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
         {
             $this->_begin( $fname );
 
-            // both files are locked for update
-            if ( !$res = $this->_query( "SELECT * FROM ezdbfile WHERE name_hash=MD5('$generatingFilePath') FOR UPDATE", $fname, true ) )
+            // both files are locked for update, and generating metadata are read
+            if ( !$res = $this->_query( "SELECT * FROM ezdbfile WHERE name_hash=" . $this->_quote( md5( $generatingFilePath ) ) . " FOR UPDATE", $fname, true ) )
             {
                 $this->_rollback( $fname );
                 return false;
             }
-            $generatingMetaData = pg_fetch_assoc( $res );
+            $generatingMetaData = $res->fetch( PDO::FETCH_ASSOC );
+            $res->closeCursor();
+            $res = null;
 
-            $res = $this->_query( "SELECT * FROM ezdbfile WHERE name_hash=MD5('$filePath') FOR UPDATE", $fname, false );
+            // Lock target row
+            $res = $this->_query( "SELECT * FROM ezdbfile WHERE name_hash=".$this->_quote( md5 ( $filePath ) )." FOR UPDATE", $fname, false );
+            $originalNumRowCount = $res->rowCount();
+            $res->closeCursor();
+            $res = null;
+
             // the original file does not exist: we move the generating file
-            if ( pg_num_rows( $res ) == 0 )
+            if ( $originalNumRowCount === 0 )
             {
                 $metaData = $generatingMetaData;
                 $metaData['name'] = $filePath;
                 $metaData['name_hash'] = md5( $filePath );
-                $metaData['name_trunk'] = $this->nameTrunk( $filePath, $metaData['scope'] );
                 $insertSQL = "INSERT INTO ezdbfile ( " . implode( ', ', array_keys( $metaData ) ) . " ) " .
                              "VALUES( " . $this->_sqlList( $metaData ) . ")";
-                if ( !$this->_query( $insertSQL, $fname, true ) )
-                {
+                $deleteSQL = "DELETE FROM ezdbfile WHERE name_hash=" . $this->_quote( md5( $generatingFilePath ) );
+                try {
+                    $this->db->exec( $insertSQL );
+                    $this->db->exec( $deleteSQL );
+                } catch( PDOException $e ) {
                     $this->_rollback( $fname );
+                    echo "Exception occured when moving generating file: " . $e->getMessage() . "\n";
                     return false;
                 }
-                if ( !$this->_query( "UPDATE " . TABLE_DATA . " SET name_hash=MD5('$filePath') WHERE name_hash=MD5('$generatingFilePath')", $fname, true ) )
-                {
-                    $this->_rollback( $fname );
-                    return false;
-                }
-                $this->_query( "DELETE FROM ezdbfile WHERE name_hash=MD5('$generatingFilePath')", $fname, true );
+
+                // @todo Move data
             }
             // the original file exists: we move the generating data to this file
             // and update it
             else
             {
-                /*$this->_query( "DELETE FROM " . TABLE_DATA . " WHERE name_hash=MD5('$filePath')", $fname, false );
-                if ( !$this->_query( "UPDATE " . TABLE_DATA . " SET name_hash=MD5('$filePath') WHERE name_hash=MD5('$generatingFilePath')", $fname, true ) )
-                {
-                    $this->_rollback( $fname );
-                    return false;
-                }*/
-
                 $mtime = $generatingMetaData['mtime'];
                 $filesize = $generatingMetaData['size'];
-                if ( !$this->_query( "UPDATE ezdbfile SET mtime = '{$mtime}', expired = 0, size = '{$filesize}' WHERE name_hash=MD5('$filePath')", $fname, true ) )
-                {
+                $updateSQL = "UPDATE ezdbfile SET mtime = " . $this->_quote( $mtime ) . ", expired = 0, " .
+                             "size = ".$this->_quote( $filesize )." WHERE name_hash=" . $this->_quote( md5( $filePath ) );
+                $deleteSQL = "DELETE FROM ezdbfile WHERE name_hash=" . $this->_quote( md5( $generatingFilePath ) );
+                try {
+                    $this->db->exec( $updateSQL );
+                    $this->db->exec( $deleteSQL );
+                } catch( PDOException $e ) {
                     $this->_rollback( $fname );
+                    echo "Exception occured when moving generating file: " . $e->getMessage() . "\n";
                     return false;
                 }
-                $this->_query( "DELETE FROM ezdbfile WHERE name_hash=MD5('$generatingFilePath')", $fname, true );
             }
 
             $this->_commit( $fname );
@@ -1468,39 +1552,37 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
         eZDebug::accumulatorStart( 'pg_cluster_query', 'pg_cluster_total', 'PostgreSQL_cluster_queries' );
         $time = microtime( true );
 
-        $nameHash = $this->_md5( $generatingFilePath );
+        $nameHash = md5( $generatingFilePath );
         $newMtime = time();
 
         // The update query will only succeed if the mtime wasn't changed in between
-        $query = "UPDATE ezdbfile SET mtime = $newMtime WHERE name_hash = {$nameHash} AND mtime = $generatingFileMtime";
-        $res = pg_query( $this->db, $query );
-        if ( !$res )
+        $query = "UPDATE ezdbfile SET mtime = ".$this->_quote( $newMtime ).
+                 " WHERE name_hash = ".$this->_quote( $nameHash )." AND mtime = " . $this->_quote( $generatingFileMtime );
+        $affectedRows = $this->db->exec( $query );
+        if ( $affectedRows === false )
         {
             $this->_error( $query, $fname );
             return false;
         }
-        $numRows = pg_affected_rows( $this->db );
 
         // reporting. Manual here since we don't use _query
         $time = microtime( true ) - $time;
-        $this->_report( $query, $fname, $time, $numRows );
+        $this->_report( $query, $fname, $time, $affectedRows );
 
         // no rows affected or row updated with the same value
         // f.e a cache-block which takes less than 1 sec to get generated
         // if a line has been updated by the same  values, mysqli_affected_rows
         // returns 0, and updates nothing, we need to extra check this,
-        if( $numRows == 0 )
+        if( $affectedRows == 0 )
         {
-            $query = "SELECT mtime FROM ezdbfile WHERE name_hash = {$nameHash}";
-            $res = pg_query( $this->db, $query );
-            pg_fetch_row( $res );
-            if( $res and isset( $row[0] ) and $row[0] == $generatingFileMtime );
+            $row = $this->_selectOneRow( "SELECT mtime FROM ezdbfile WHERE name_hash = " . $this->_quote( $nameHash ) );
+            if( $res && isset( $row[0] ) && $row[0] == $generatingFileMtime )
                 return true;
-
-            return false;
+            else
+                return false;
         }
         // rows affected: mtime has changed, or row has been removed
-        if ( $numRows == 1 )
+        if ( $affectedRows == 1 )
         {
             return true;
         }
@@ -1519,47 +1601,8 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
     **/
     function _abortCacheGeneration( $generatingFilePath )
     {
-        $sql = "DELETE FROM ezdbfile WHERE name_hash = " . $this->_md5( $generatingFilePath );
+        $sql = "DELETE FROM ezdbfile WHERE name_hash = " . $this->_quote( md5( $generatingFilePath ) );
         $this->_query( $sql, "_abortCacheGeneration( '$generatingFilePath' )" );
-    }
-
-    /**
-    * Returns the name_trunk for a file path
-    * @param string $filePath
-    * @param string $scope
-    * @return string
-    **/
-    static function nameTrunk( $filePath, $scope )
-    {
-        switch ( $scope )
-        {
-            case 'viewcache':
-            {
-                $nameTrunk = substr( $filePath, 0, strrpos( $filePath, '-' ) + 1 );
-            } break;
-
-            case 'template-block':
-            {
-                $templateBlockCacheDir = eZTemplateCacheBlock::templateBlockCacheDir();
-                $templateBlockPath = str_replace( $templateBlockCacheDir, '', $filePath );
-                if ( strstr( $templateBlockPath, 'subtree/' ) !== false )
-                {
-                    // 6 = strlen( 'cache/' );
-                    $len = strlen( $templateBlockCacheDir ) + strpos( $templateBlockPath, 'cache/' ) + 6;
-                    $nameTrunk = substr( $filePath, 0, $len  );
-                }
-                else
-                {
-                    $nameTrunk = $filePath;
-                }
-            } break;
-
-            default:
-            {
-                $nameTrunk = $filePath;
-            }
-        }
-        return $nameTrunk;
     }
 
     /**
@@ -1624,6 +1667,35 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
     }
 
     /**
+     * Returns the PDO field type based on the field name
+     *
+     * @param string $field
+     * @return int One of the PDO::PARAM_* constants
+     */
+    public function _PDOtype( $field )
+    {
+        switch( $field )
+        {
+            case 'datatype':
+            case 'name_hash':
+            case 'scope':
+            case 'name':
+                return PDO::PARAM_STR;
+
+            case 'size':
+            case 'mtime':
+            case 'expired':
+                return PDO::PARAM_INT;
+
+            case 'data':
+                return PDO::PARAM_INT; // We use OID and not BYTEA, and therefore will store an integer
+
+            default:
+                throw new Exception( "Unknown cluster database field '$field'" );
+        }
+    }
+
+    /**
      * Stores binary data to the database from a filename
      *
      * @param int $loid Large Object ID as returned by lo_open()
@@ -1639,11 +1711,17 @@ class eZDBFileHandlerPostgresqlBackend implements eZDBFileHandlerBackend
         pg_lo_close( $handle );
     }
 
+    /**
+     * @var PDO
+     */
     public $db   = null;
+
     public $numQueries = 0;
     public $transactionCount = 0;
     public static $dbparams;
     private $backendVerify = null;
+
+    const DBERROR_DUPLICATE_KEY = '23505';
 }
 
 ?>

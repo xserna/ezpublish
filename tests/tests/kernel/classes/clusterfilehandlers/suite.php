@@ -10,8 +10,8 @@
 class eZClusterTestSuite extends ezpDatabaseTestSuite
 {
     protected $sqlFiles = array(
-        array( 'kernel/sql/', 'db_cluster_schema.sql' ),
-        array( 'kernel/sql/', 'dfs_cluster_schema.sql' ),
+        array( 'kernel/sql/', 'cluster_db_schema.sql' ),
+        array( 'kernel/sql/', 'cluster_dfs_schema.sql' ),
     );
 
     public function __construct()
