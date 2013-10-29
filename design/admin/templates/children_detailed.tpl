@@ -125,6 +125,10 @@ var labelsObj = {ldelim}
         {def $group_id = array( ezini( 'ClassGroupIDs', 'Setup', 'content.ini' ),
                                 ezini( 'ClassGroupIDs', 'Content', 'content.ini' ),
                                 ezini( 'ClassGroupIDs', 'Media', 'content.ini' ) )}
+        {* Enable option to exclude custom class groups on Users section create menu *}
+        {if ezini_hasvariable( 'ClassGroupIDs', 'CustomContent', 'content.ini' ) }
+            {set $group_id = $group_id|merge( ezini( 'ClassGroupIDs', 'CustomContent', 'content.ini' ) )}
+        {/if}
     {else}
         {def $group_id = false()}
     {/if}
