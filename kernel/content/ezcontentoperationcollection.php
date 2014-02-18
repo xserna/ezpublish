@@ -2,7 +2,7 @@
 /**
  * File containing the eZContentOperationCollection class.
  *
- * @copyright Copyright (C) 1999-2013 eZ Systems AS. All rights reserved.
+ * @copyright Copyright (C) 1999-2014 eZ Systems AS. All rights reserved.
  * @license http://www.gnu.org/licenses/gpl-2.0.txt GNU General Public License v2
  * @version //autogentag//
  * @package kernel
@@ -484,9 +484,19 @@ class eZContentOperationCollection
     static public function removeOldNodes( $objectID, $versionNum )
     {
         $object = eZContentObject::fetch( $objectID );
-
+        if ( !$object instanceof eZContentObject )
+        {
+            eZDebug::writeError( 'Unable to find object #' . $objectID, __METHOD__ );
+            return;
+        }
 
         $version = $object->version( $versionNum );
+        if ( !$version instanceof eZContentObjectVersion )
+        {
+            eZDebug::writeError( 'Unable to find version #' . $versionNum . ' for object #' . $objectID, __METHOD__ );
+            return;
+        }
+
         $moveToTrash = true;
 
         $assignedExistingNodes = $object->attribute( 'assigned_nodes' );
@@ -587,7 +597,7 @@ class eZContentOperationCollection
         if ( eZSearch::needRemoveWithUpdate() )
         {
             eZDebug::accumulatorStart( 'remove_object', 'search_total', 'remove object' );
-            eZSearch::removeObjectById( $objectID, $needCommit );
+            eZSearch::removeObjectById( $objectID );
             eZDebug::accumulatorStop( 'remove_object' );
         }
 
@@ -1210,6 +1220,8 @@ class eZContentOperationCollection
     {
         eZContentObjectTreeNode::updateMainNodeID( $mainAssignmentID, $ObjectID, false, $mainAssignmentParentID );
         eZContentCacheManager::clearContentCacheIfNeeded( $ObjectID );
+        eZContentOperationCollection::registerSearchObject( $ObjectID );
+
         return array( 'status' => true );
     }
 
